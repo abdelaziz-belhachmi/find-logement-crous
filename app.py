@@ -1,17 +1,17 @@
+from dotenv import load_dotenv
+load_dotenv(override=True)  # must run before importing scraper (it imports config, which reads env vars)
+
 from flask import Flask, render_template, request, redirect, url_for, flash
 from flask_socketio import SocketIO, emit
 import threading
 import time
 import logging
 from models import db, Alert, AlertLog
-from scraper import check_for_results
-import json 
-from dotenv import load_dotenv
+from scraper import check_for_results, clear_seen
+import json
 import os
 from datetime import datetime
 
-
-load_dotenv(override=True)
 
 app = Flask(__name__)
 SECRET_KEY = os.getenv('SECRET_KEY')
@@ -39,6 +39,7 @@ logging.basicConfig(level=logging.INFO)
 # Track scraping threads
 scraping_threads = {}
 
+
 def log_message(message, alert=None):
     """Helper function to format and log messages with additional details."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -46,6 +47,7 @@ def log_message(message, alert=None):
     full_message = f"{timestamp} {alert_name} {message}"
     logger.info(full_message)
     socketio.emit('log', {'message': full_message})
+
 
 def start_scraping(alert_id):
     """Scraping logic for a specific alert."""
@@ -58,14 +60,17 @@ def start_scraping(alert_id):
         log_message(f"Started scraping for {alert.city} with max price {alert.price}", alert)
 
         while alert.status:
-            if check_for_results(alert):
-                log_message(f"Results found for {alert.city}!", alert)
-                # Deactivate the alert after finding results
-                alert.status = False
-                db.session.commit()
-                break
+            try:
+                found = check_for_results(alert)
+            except Exception:
+                logger.exception('Unexpected error in check_for_results')
+                found = False
+
+            if found:
+                log_message(f"New listings found for {alert.city}, email sent. Waiting for {alert.interval} seconds.", alert)
             else:
-                log_message(f"No results for {alert.city}. Waiting for {alert.interval} seconds before next check.", alert)
+                log_message(f"No new listings for {alert.city}. Waiting for {alert.interval} seconds before next check.", alert)
+
             time.sleep(alert.interval)
             # Refresh the alert status from the database
             db.session.refresh(alert)
@@ -77,35 +82,42 @@ def start_scraping(alert_id):
             del scraping_threads[alert_id]
 
 
-
 def manage_alerts():
     """Background task that checks the status of all alerts and starts/stops scraping."""
+    logger.info('Alert manager started.')
+    last_active = None
     while True:
-        with app.app_context():
-            alerts = Alert.query.filter_by(status=True).all()
-            for alert in alerts:
-                if alert.id not in scraping_threads or not scraping_threads[alert.id].is_alive():
-                    thread = threading.Thread(target=start_scraping, args=(alert.id,))
-                    thread.start()
-                    scraping_threads[alert.id] = thread
+        try:
+            with app.app_context():
+                alerts = Alert.query.filter_by(status=True).all()
+                active_ids = sorted(a.id for a in alerts)
+                if active_ids != last_active:
+                    total = Alert.query.count()
+                    logger.info(f'Alert manager: {len(active_ids)} active alert(s) {active_ids} out of {total} total.')
+                    last_active = active_ids
+                for alert in alerts:
+                    if alert.id not in scraping_threads or not scraping_threads[alert.id].is_alive():
+                        thread = threading.Thread(target=start_scraping, args=(alert.id,), daemon=True)
+                        thread.start()
+                        scraping_threads[alert.id] = thread
+        except Exception:
+            logger.exception('manage_alerts error')
 
         time.sleep(5)  # Check every 5 seconds for active alerts
 
-
-
-# Start the background alert manager
-threading.Thread(target=manage_alerts, daemon=True).start()
 
 # Load meta.json to pass to templates
 def get_meta_data():
     with open('static/meta.json') as meta_file:
         return json.load(meta_file)
 
+
 @app.route('/')
 def index():
     meta = get_meta_data()
     alerts = Alert.query.all()
     return render_template('index.html', alerts=alerts, meta=meta)
+
 
 @app.route('/alerts/new', methods=['GET', 'POST'])
 def create_alert():
@@ -123,10 +135,10 @@ def create_alert():
         alert = Alert(name=name, city=city, bounds=bounds, price=price, emails=emails, interval=interval, status=status)
         db.session.add(alert)
         db.session.commit()
-        
+
         flash('Alert created successfully!')
         return redirect(url_for('index'))
-    
+
     return render_template('create_alert.html', meta=meta)
 
 
@@ -134,7 +146,7 @@ def create_alert():
 def edit_alert(alert_id):
     meta = get_meta_data()
     alert = Alert.query.get_or_404(alert_id)
-    
+
     if request.method == 'POST':
         alert.name = request.form['city']  # Update the alert name
         alert.city = request.form['city']  # Keep city as it is
@@ -145,10 +157,10 @@ def edit_alert(alert_id):
         alert.interval = int(request.form['interval'])
         alert.status = request.form.get('status') == 'on'
         db.session.commit()
-        
+
         flash('Alert updated successfully!')
         return redirect(url_for('index'))
-    
+
     logs = AlertLog.query.filter_by(alert_id=alert.id).all()
     return render_template('edit_alert.html', alert=alert, logs=logs, meta=meta)
 
@@ -175,27 +187,47 @@ def delete_alert(alert_id):
             alert.status = False
             db.session.commit()
             scraping_threads[alert_id].join()  # Wait for the thread to finish
-            del scraping_threads[alert_id]  # Remove from the thread tracking dictionary
+            scraping_threads.pop(alert_id, None)  # Remove from the thread tracking dictionary
 
         log_message(f"Alert for {alert.city} is being deleted.", alert)
+        clear_seen(alert_id)
         db.session.delete(alert)
         db.session.commit()
         flash('Alert deleted successfully!')
     return redirect(url_for('index'))
 
 
-
 @socketio.on('start_scraping')
 def handle_start_scraping(data):
-    alert = Alert.query.get(data['alert_id'])
-    if alert and not scraping_active:
-        threading.Thread(target=start_scraping, args=(alert,)).start()
+    """Activate the alert; manage_alerts() picks it up within 5 seconds."""
+    with app.app_context():
+        alert = Alert.query.get(data['alert_id'])
+        if alert:
+            alert.status = True
+            db.session.commit()
+            log_message(f"Alert for {alert.city} activated.", alert)
+
 
 @socketio.on('stop_scraping')
-def handle_stop_scraping():
-    global scraping_active
-    scraping_active = False
-    logger.info('Scraping stopped manually.')
+def handle_stop_scraping(data=None):
+    """Deactivate the alert; its thread exits after the current wait."""
+    with app.app_context():
+        alert_id = (data or {}).get('alert_id')
+        alert = Alert.query.get(alert_id) if alert_id else None
+        if alert:
+            alert.status = False
+            db.session.commit()
+            log_message(f"Alert for {alert.city} deactivated.", alert)
+        else:
+            logger.info('stop_scraping received without a valid alert_id.')
+
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True, allow_unsafe_werkzeug=True)
+    # Service / normal run: no reloader, debug off.
+    # For development set FLASK_DEBUG=1 (reloader on; the manager then starts only in
+    # the child process that serves requests, otherwise alerts would run twice).
+    debug = os.environ.get('FLASK_DEBUG') == '1'
+    if not debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        threading.Thread(target=manage_alerts, daemon=True).start()
+    socketio.run(app, host='127.0.0.1', port=5000, debug=debug, use_reloader=debug,
+                 allow_unsafe_werkzeug=True)

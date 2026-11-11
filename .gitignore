@@ -4,3 +4,6 @@ __pycache__/
 node_modules/
 package-lock.json
 context.md 
+service.log
+seen_offers.json
+instance/alerts.db
